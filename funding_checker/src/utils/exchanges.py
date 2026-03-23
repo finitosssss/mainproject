@@ -4,6 +4,7 @@ import json
 import time
 import logging
 from typing import Dict, List, Optional, Tuple, Set, Any
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -14,17 +15,17 @@ class ExchangeAPI:
         self.ws_url = ""
         self.max_ws_subscriptions = 100
 
-    async def get_available_symbols(self, session: aiohttp.ClientSession) -> Set[str]:
+    async def get_available_symbols(self, session: aiohttp.ClientSession, category: str = "spot") -> Set[str]:
         raise NotImplementedError
 
     async def fetch_recent_trades(self, session: aiohttp.ClientSession, symbol: str, limit: int) -> List[Any]:
         raise NotImplementedError
 
-    async def fetch_klines(self, session: aiohttp.ClientSession, symbol: str, interval: str, limit: int) -> List[Any]:
+    async def fetch_klines(self, session: aiohttp.ClientSession, symbol: str, interval: str, limit: int, category: str = "spot") -> List[Any]:
         raise NotImplementedError
 
-    def parse_kline(self, kline: Any) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
-        """Returns (timestamp_ms, open, high, low, close)."""
+    def parse_kline(self, kline: Any) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """Returns (timestamp_ms, open, high, low, close, volume)."""
         raise NotImplementedError
 
     def parse_trade(self, trade: Any) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
@@ -42,8 +43,8 @@ class ExchangeAPI:
         raise NotImplementedError
 
     # New methods for funding rates and futures prices
-    async def fetch_funding_rate(self, session: aiohttp.ClientSession, symbol: str) -> Optional[float]:
-        """Returns funding rate in percent (e.g., 0.01 for 0.01%)."""
+    async def fetch_funding_rate(self, session: aiohttp.ClientSession, symbol: str) -> Tuple[Optional[float], Optional[int]]:
+        """Returns (funding_rate_in_percent, next_funding_time_ms)."""
         raise NotImplementedError
 
     async def fetch_ticker_price(self, session: aiohttp.ClientSession, symbol: str) -> Optional[float]:
@@ -56,8 +57,8 @@ class BybitAPI(ExchangeAPI):
         self.ws_url = "wss://stream.bybit.com/v5/public/spot"
         self.max_ws_subscriptions = 500
 
-    async def get_available_symbols(self, session):
-        url = "https://api.bybit.com/v5/market/instruments-info?category=spot"
+    async def get_available_symbols(self, session, category="spot"):
+        url = f"https://api.bybit.com/v5/market/instruments-info?category={category}"
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -76,8 +77,8 @@ class BybitAPI(ExchangeAPI):
         except Exception: pass
         return []
 
-    async def fetch_klines(self, session, symbol, interval, limit):
-        url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={interval}&limit={limit}"
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
+        url = f"https://api.bybit.com/v5/market/kline?category={category}&symbol={symbol}&interval={interval}&limit={limit}"
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -87,8 +88,8 @@ class BybitAPI(ExchangeAPI):
         return []
 
     def parse_kline(self, kline):
-        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4])
-        except: return None, None, None, None, None
+        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4]), float(kline[5])
+        except: return None, None, None, None, None, None
 
     def parse_trade(self, trade):
         try: return float(trade.get('price', 0)), float(trade.get('size', 0)), float(trade.get('time', 0)), trade.get('side', 'unknown')
@@ -126,9 +127,12 @@ class BybitAPI(ExchangeAPI):
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return float(data["result"]["list"][0]["fundingRate"]) * 100
+                    item = data["result"]["list"][0]
+                    rate = float(item["fundingRate"]) * 100
+                    next_time = int(item.get("nextFundingTime", 0))
+                    return rate, next_time
         except Exception: pass
-        return None
+        return None, None
 
     async def fetch_ticker_price(self, session, symbol):
         url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}USDT"
@@ -146,13 +150,19 @@ class BinanceAPI(ExchangeAPI):
         self.ws_url = "wss://stream.binance.com:9443/ws"
         self.max_ws_subscriptions = 100
 
-    async def get_available_symbols(self, session):
-        url = "https://api.binance.com/api/v3/exchangeInfo"
+    async def get_available_symbols(self, session, category="spot"):
+        if category == "spot":
+            url = "https://api.binance.com/api/v3/exchangeInfo"
+        else:
+            url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return set([item["symbol"] for item in data.get("symbols", []) if item.get("status") == "TRADING" and item.get("isSpotTradingAllowed")])
+                    if category == "spot":
+                        return set([item["symbol"] for item in data.get("symbols", []) if item.get("status") == "TRADING" and item.get("isSpotTradingAllowed")])
+                    else:
+                        return set([item["symbol"] for item in data.get("symbols", []) if item.get("status") == "TRADING"])
         except Exception: return set()
         return set()
 
@@ -164,10 +174,13 @@ class BinanceAPI(ExchangeAPI):
         except: pass
         return []
 
-    async def fetch_klines(self, session, symbol, interval, limit):
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
         interval_map = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h", "240": "4h", "D": "1d"}
         bin_interval = interval_map.get(str(interval), "1m")
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={bin_interval}&limit={limit}"
+        if category == "spot":
+            url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={bin_interval}&limit={limit}"
+        else:
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={bin_interval}&limit={limit}"
         try:
             async with session.get(url) as resp:
                 if resp.status == 200: return await resp.json()
@@ -175,8 +188,8 @@ class BinanceAPI(ExchangeAPI):
         return []
 
     def parse_kline(self, kline):
-        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4])
-        except: return None, None, None, None, None
+        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4]), float(kline[5])
+        except: return None, None, None, None, None, None
 
     def parse_trade(self, trade):
         try:
@@ -217,9 +230,11 @@ class BinanceAPI(ExchangeAPI):
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return float(data["lastFundingRate"]) * 100
+                    rate = float(data["lastFundingRate"]) * 100
+                    next_time = int(data.get("nextFundingTime", 0))
+                    return rate, next_time
         except Exception: pass
-        return None
+        return None, None
 
     async def fetch_ticker_price(self, session, symbol):
         url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}USDT"
@@ -237,8 +252,9 @@ class OKXAPI(ExchangeAPI):
         self.ws_url = "wss://ws.okx.com:8443/ws/v5/public"
         self.max_ws_subscriptions = 100
 
-    async def get_available_symbols(self, session):
-        url = "https://www.okx.com/api/v5/public/instruments?instType=SPOT"
+    async def get_available_symbols(self, session, category="spot"):
+        inst_type = "SPOT" if category == "spot" else "SWAP"
+        url = f"https://www.okx.com/api/v5/public/instruments?instType={inst_type}"
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -257,10 +273,11 @@ class OKXAPI(ExchangeAPI):
         except: pass
         return []
 
-    async def fetch_klines(self, session, symbol, interval, limit):
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
         interval_map = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1H", "240": "4H", "D": "1D"}
         okx_interval = interval_map.get(str(interval), "1m")
         url = f"https://www.okx.com/api/v5/market/history-candles?instId={symbol}&bar={okx_interval}&limit={limit}"
+        # Note: OKX uses same endpoint for spot and swap history
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -270,8 +287,8 @@ class OKXAPI(ExchangeAPI):
         return []
 
     def parse_kline(self, kline):
-        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4])
-        except: return None, None, None, None, None
+        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4]), float(kline[5])
+        except: return None, None, None, None, None, None
 
     def parse_trade(self, trade):
         try:
@@ -313,9 +330,12 @@ class OKXAPI(ExchangeAPI):
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return float(data["data"][0]["fundingRate"]) * 100
+                    item = data["data"][0]
+                    rate = float(item["fundingRate"]) * 100
+                    next_time = int(item.get("nextFundingTime", 0))
+                    return rate, next_time
         except Exception: pass
-        return None
+        return None, None
 
     async def fetch_ticker_price(self, session, symbol):
         url = f"https://www.okx.com/api/v5/market/ticker?instId={symbol}-USDT-SWAP"
@@ -333,7 +353,7 @@ class BitmartAPI(ExchangeAPI):
         self.ws_url = "wss://ws-manager-compress.bitmart.com/api?protocol=1.1"
         self.max_ws_subscriptions = 50
 
-    async def get_available_symbols(self, session):
+    async def get_available_symbols(self, session, category="spot"):
         url = "https://api-cloud.bitmart.com/spot/v1/symbols/details"
         try:
             async with session.get(url) as resp:
@@ -353,7 +373,7 @@ class BitmartAPI(ExchangeAPI):
         except: pass
         return []
 
-    async def fetch_klines(self, session, symbol, interval, limit):
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
         interval_map = {"1": "1", "5": "5", "15": "15", "30": "30", "60": "60", "D": "1440", "240": "240"}
         bitmart_interval = interval_map.get(str(interval), "1")
         current_time_s = int(time.time())
@@ -368,8 +388,8 @@ class BitmartAPI(ExchangeAPI):
         return []
 
     def parse_kline(self, kline):
-        try: return float(kline.get('timestamp', 0)) * 1000, float(kline.get('open', 0)), float(kline.get('high', 0)), float(kline.get('low', 0)), float(kline.get('close', 0))
-        except: return None, None, None, None, None
+        try: return float(kline.get('timestamp', 0)) * 1000, float(kline.get('open', 0)), float(kline.get('high', 0)), float(kline.get('low', 0)), float(kline.get('close', 0)), float(kline.get('volume', 0))
+        except: return None, None, None, None, None, None
 
     def parse_trade(self, trade):
         try:
@@ -409,8 +429,11 @@ class BitgetAPI(ExchangeAPI):
         self.ws_url = "wss://ws.bitget.com/v2/ws/public"
         self.max_ws_subscriptions = 50
 
-    async def get_available_symbols(self, session):
-        url = "https://api.bitget.com/api/v2/spot/public/symbols"
+    async def get_available_symbols(self, session, category="spot"):
+        if category == "spot":
+            url = "https://api.bitget.com/api/v2/spot/public/symbols"
+        else:
+            url = "https://api.bitget.com/api/v2/mix/market/symbols?productType=USDT-FUTURES"
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -429,10 +452,13 @@ class BitgetAPI(ExchangeAPI):
         except: pass
         return []
 
-    async def fetch_klines(self, session, symbol, interval, limit):
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
         interval_map = {"1": "1min", "5": "5min", "15": "15min", "30": "30min", "60": "1h", "D": "1day", "240": "4h"}
         bitget_interval = interval_map.get(str(interval), "1min")
-        url = f"https://api.bitget.com/api/v2/spot/market/candles?symbol={symbol}&granularity={bitget_interval}&limit={limit}"
+        if category == "spot":
+            url = f"https://api.bitget.com/api/v2/spot/market/candles?symbol={symbol}&granularity={bitget_interval}&limit={limit}"
+        else:
+            url = f"https://api.bitget.com/api/v2/mix/market/candles?symbol={symbol}&granularity={bitget_interval}&limit={limit}"
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -442,8 +468,8 @@ class BitgetAPI(ExchangeAPI):
         return []
 
     def parse_kline(self, kline):
-        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4])
-        except: return None, None, None, None, None
+        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4]), float(kline[5])
+        except: return None, None, None, None, None, None
 
     def parse_trade(self, trade):
         try:
@@ -485,9 +511,11 @@ class BitgetAPI(ExchangeAPI):
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("code") == "00000":
-                        return float(data["data"]["fundingRate"]) * 100
+                        rate = float(data["data"]["fundingRate"]) * 100
+                        next_time = int(data["data"].get("nextFundingTime", 0))
+                        return rate, next_time
         except Exception: pass
-        return None
+        return None, None
 
     async def fetch_ticker_price(self, session, symbol):
         url = f"https://api.bitget.com/api/mix/v1/market/ticker?symbol={symbol}USDT_UMCBL"
@@ -506,8 +534,11 @@ class BingXAPI(ExchangeAPI):
         self.ws_url = "wss://open-api-ws.bingx.com/market"
         self.max_ws_subscriptions = 50
 
-    async def get_available_symbols(self, session):
-        url = "https://open-api.bingx.com/openApi/spot/v1/common/symbols"
+    async def get_available_symbols(self, session, category="spot"):
+        if category == "spot":
+            url = "https://open-api.bingx.com/openApi/spot/v1/common/symbols"
+        else:
+            url = "https://open-api.bingx.com/openApi/swap/v2/quote/allSymbols"
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -526,10 +557,13 @@ class BingXAPI(ExchangeAPI):
         except: pass
         return []
 
-    async def fetch_klines(self, session, symbol, interval, limit):
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
         interval_map = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h", "D": "1d", "240": "4h"}
         bingx_interval = interval_map.get(str(interval), "1m")
-        url = f"https://open-api.bingx.com/openApi/spot/v2/market/kline?symbol={symbol}&interval={bingx_interval}&limit={limit}"
+        if category == "spot":
+            url = f"https://open-api.bingx.com/openApi/spot/v2/market/kline?symbol={symbol}&interval={bingx_interval}&limit={limit}"
+        else:
+            url = f"https://open-api.bingx.com/openApi/swap/v3/quote/klines?symbol={symbol}&interval={bingx_interval}&limit={limit}"
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
@@ -539,8 +573,8 @@ class BingXAPI(ExchangeAPI):
         return []
 
     def parse_kline(self, kline):
-        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4])
-        except: return None, None, None, None, None
+        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4]), float(kline[5])
+        except: return None, None, None, None, None, None
 
     def parse_trade(self, trade):
         try:
@@ -585,9 +619,12 @@ class MEXCAPI(ExchangeAPI):
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return float(data["data"][0]["fundingRate"]) * 100
+                    item = data["data"][0]
+                    rate = float(item["fundingRate"]) * 100
+                    next_time = int(item.get("nextFundingTime", 0))
+                    return rate, next_time
         except Exception: pass
-        return None
+        return None, None
 
     async def fetch_ticker_price(self, session, symbol):
         url = f"https://contract.mexc.com/api/v1/contract/ticker?symbol={symbol}_USDT"
@@ -609,9 +646,12 @@ class KuCoinAPI(ExchangeAPI):
             async with session.get(url) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return float(data["data"]["value"]) * 100
+                    item = data["data"]
+                    rate = float(item["value"]) * 100
+                    next_time = int(item.get("timePoint", 0))
+                    return rate, next_time
         except Exception: pass
-        return None
+        return None, None
 
     async def fetch_ticker_price(self, session, symbol):
         url = f"https://api-futures.kucoin.com/api/v1/ticker?symbol={symbol}USDTM"

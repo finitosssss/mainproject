@@ -1,6 +1,7 @@
 import os
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple, Any
 from pymongo import MongoClient
 from bson import ObjectId
 from dotenv import load_dotenv
@@ -75,10 +76,10 @@ async def get_funding_rate(exchange_name, symbol):
         return await api.fetch_funding_rate(session, symbol)
     except Exception as e:
         logger.error(f"Error fetching funding rate from {exchange_name} for {symbol}: {e}")
-    return None
+    return None, None
 
 # last_funding_notifications[token] = (datetime, timedelta)
-last_funding_notifications = {}
+last_funding_notifications: Dict[str, Tuple[datetime, timedelta]] = {}
 
 async def check_funding_rates():
     logger.info("Starting funding rates monitoring")
@@ -117,21 +118,40 @@ async def check_funding_rates():
                 logger.info(f"Токен {token} удален из кэша funding мониторинга")
 
             for token, token_config in active_tokens.items():
+                if not isinstance(token, str):
+                    continue
                 threshold = token_config.get("threshold", -0.0001)
-                logger.debug(f"Проверка {token} (порог: {threshold})")
+                time_funding_left = token_config.get("time-funding_left") # в минутах
+                logger.debug(f"Проверка {token} (порог: {threshold}, окно: {time_funding_left})")
 
                 funding_rates = {}
                 min_rate = None
+                earliest_next_funding = None
 
                 for exchange in token_config.get("exchanges", []):
-                    rate = await get_funding_rate(exchange, token)
+                    # rate: Optional[float], next_time_ms: Optional[int]
+                    rate_data = await get_funding_rate(exchange, token)
+                    rate, next_time_ms = rate_data
                     if rate is not None:
                         funding_rates[exchange] = rate
                         if min_rate is None or rate < min_rate:
                             min_rate = rate
+                        
+                        if next_time_ms is not None:
+                            if earliest_next_funding is None or int(next_time_ms) < int(earliest_next_funding):
+                                earliest_next_funding = int(next_time_ms)
 
                 if min_rate is None:
                     continue
+
+                # Проверка временного окна
+                if time_funding_left is not None and earliest_next_funding is not None:
+                    next_funding_dt = datetime.fromtimestamp(float(earliest_next_funding) / 1000.0, tz=timezone.utc)
+                    time_until_funding = (next_funding_dt - now).total_seconds() / 60.0
+                    
+                    if time_until_funding > time_funding_left:
+                        logger.debug(f"{token}: вне временного окна ({time_until_funding:.1f} мин > {time_funding_left} мин). Пропуск.")
+                        continue
 
                 if min_rate >= threshold:
                     logger.debug(f"Токен {token} не превысил порог: {min_rate:.4f}% >= {threshold}%")
