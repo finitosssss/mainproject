@@ -73,27 +73,68 @@ Comprehensive guide for the bots and their MongoDB configurations.
 
 ### 📈 Volume Tracker Configuration
 `Database: volume_tracker | Collection: exchange_configs`
-*Один документ на каждую биржу.*
+*Один документ может описывать одну или несколько бирж сразу.*
 
 ```json
 {
   "global_tracking": true,
-  "exchange": "bybit",         // Название биржи (строчными буквами)
+  "exchange": ["bybit", "okx"], // Теперь поддерживает как строку "bybit", так и список ["bybit", "okx"]
   "tokens": [
     {
-      "symbol": "BTCUSDT",     // Торговая пара
-      "enabled": true,         // Включение токена
-      "minute_volume": 1000,   // Порог объема в $ за 1 минуту для алерта
-      "volatility": 0.01,      // Макс. допустимая волатильность (0.01 = 1%)
-      "tokens_transactions": "100-500", // Диапазон кол-ва токенов в сделках для отслеживания
+      "symbol": "BTCUSDT",      // Стандартный тикер
+      "bybit_symbol": "BTCUSDT", // Опционально: специфичный тикер для конкретной биржи
+      "enabled": true,
+      "minute_volume": 1000,    // Порог объема в $ за 1 минуту
+      "volatility": 0.01,       // Порог волатильности (0.01 = 1%)
+      "volty_handels": 0.003,   // Порог для детекции низкой волатильности (на 3-х свечах)
+      "tokens_transactions": "100-500", // Поиск сделок в диапазоне кол-ва токенов
       "green_candles": {
-        "count": 5,            // Кол-во подряд идущих зеленых свечей
-        "volatility_thresholds": [0.001, 0.001, ...] // Порог волатильности для каждой свечи
+        "count": 5,
+        "volatility_thresholds": [0.001, 0.001, 0.001, 0.001, 0.001]
       }
     }
   ]
 }
 ```
+> [!NOTE]
+> **Bybit Alpha (DEX Pro):** Для токенов из раздела Alpha, которые уже залистились на основной Spot (например, BSB, BASED), рекомендуется использовать `symbol` формата `BSBUSDT` и тип данных `exchange`. Это обеспечивает более стабильное получение данных.
+
+---
+
+## ⚙️ Environment Variables (.env)
+
+Для корректной работы всех модулей в корне проекта должен быть файл `.env` со следующими параметрами:
+
+```bash
+# MongoDB Connection
+MONGO_URI=mongodb://...
+
+# Telegram Bot Tokens
+VOLUME_TRACKER_TOKEN=...
+TRADING_TOOLS_TOKEN=...
+UNIQUE_STRATEGY_TOKEN=...
+FUNDING_BOT_TOKEN=...
+HEDGE_BOT_TOKEN=...
+
+# Chat IDs
+VOLUME_TRACKER_CHAT_IDS=-100...
+TRADING_TOOLS_CHAT_IDS=-100...
+UNIQUE_STRATEGY_CHAT_IDS=-100...
+TELEGRAM_CHAT_ID=-100... # Общий для фандинга и хеджа
+
+# Database & Collection Names
+MONGO_DB_NAME_VOLUME_TRACKER=volume_tracker
+MONGO_COLLECTION_NAME_VOLUME_TRACKER=exchange_configs
+# ... и другие для каждого модуля
+```
+
+## 🛠 Deployment & Maintenance
+
+Обновление и перезапуск контейнера на Azure выполняется через скрипт `redeploy.sh`:
+```bash
+bash redeploy.sh [container_name]
+```
+Скрипт автоматически собирает новый Docker-образ, пушит его в Azure Container Registry и обновляет Group Instance.
 
 ### 🔴 Unique Strategy Configuration
 `Database: unique_strategy | Collection: unique_strategy_collection`
