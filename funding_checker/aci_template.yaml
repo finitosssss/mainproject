@@ -1,0 +1,20 @@
+api-version: '2023-05-01'
+location: canadacentral
+name: checkers
+properties:
+  containers:
+  - name: checkers
+    properties:
+      image: checkers-f8ezc5dwg9cvceeh.azurecr.io/fundingchecker:latest
+      resources:
+        requests:
+          cpu: 2.0
+          memoryInGb: 3.0
+      environmentVariables: [] # Will be populated by script
+  osType: Linux
+  restartPolicy: Always
+  imageRegistryCredentials:
+  - server: checkers-f8ezc5dwg9cvceeh.azurecr.io
+    username: checkers
+    password: PLACEHOLDER_PASSWORD
+type: Microsoft.ContainerInstance/containerGroups

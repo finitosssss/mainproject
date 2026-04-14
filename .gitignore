@@ -6,3 +6,5 @@ __pycache__/
 .DS_Store
 *.log
 debug_log.txt
+funding_checker/final_deployment.yaml
+funding_checker/deployment_template.yaml
