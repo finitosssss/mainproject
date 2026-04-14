@@ -2,9 +2,17 @@
 # Complete Re-deploy script for Azure Container Instance
 # This script builds the image in ACR and updates the ACI with current .env variables.
 
-# Load environment variables from .env file
+# Safely load environment variables from .env file
 if [ -f .env ]; then
-    export $(grep -v '^#' .env | xargs)
+    while IFS='=' read -r key value; do
+        # Skip comments and empty lines
+        if [[ ! "$key" =~ ^#.*$ && -n "$key" ]]; then
+            # Remove potential carriage returns and export
+            clean_key=$(echo "$key" | tr -d '\r')
+            clean_value=$(echo "$value" | tr -d '\r')
+            export "$clean_key"="$clean_value"
+        fi
+    done < .env
 fi
 
 source /Users/macbook/.gemini/antigravity/scratch/mainproject-main/funding_checker/.venv/bin/activate
