@@ -7,6 +7,8 @@ from pymongo import MongoClient
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Set, Any
 from dotenv import load_dotenv
+import hmac
+import hashlib
 
 from utils.logger import setup_logger
 from utils.http import SessionManager
@@ -20,16 +22,43 @@ MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("MONGO_DB_NAME_UNIQUE_STRATEGY", "unique_strategy")
 COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME_UNIQUE_STRATEGY", "unique_strategy_collection")
 
+# Bybit API configuration
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
+
 # Telegram bot configuration
-TOKEN = os.getenv("UNIQUE_STRATEGY_TOKEN")
-CHAT_IDS = [cid.strip() for cid in os.getenv("UNIQUE_STRATEGY_CHAT_IDS", "").split(",") if cid.strip()]
+TOKEN = os.getenv("UNIQUE_STRATEGY_TOKEN") or os.getenv("TOKEN")
+CHAT_IDS = [cid.strip() for cid in (os.getenv("UNIQUE_STRATEGY_CHAT_IDS") or os.getenv("CHAT_IDS") or "").split(",") if cid.strip()]
+
+def format_unique_symbol(symbol: str, exchange: str) -> str:
+    if not symbol: return symbol
+    exchange = exchange.lower().strip()
+    # Skip formatting for special keywords
+    if symbol.lower() in ["spot", "futures", "linear", "all"]:
+        return symbol
+        
+    if exchange in ["bybit", "binance", "asterdex", "bitget", "bitmart"]:
+        return f"{symbol}USDT"
+    if exchange == "okx":
+        return f"{symbol}-USDT-SWAP"
+    if exchange == "kucoin":
+        return f"{symbol}USDTM"
+    if exchange == "bingx":
+        return f"{symbol}-USDT"
+    if exchange in ["gate", "mexc"]:
+        return f"{symbol}_USDT"
+    if exchange == "htx":
+        return f"{symbol}-USDT"
+    if exchange == "hyperliquid":
+        return symbol # Hyperliquid uses just the base name for perps
+    return f"{symbol}USDT"
 
 # Logging configuration
 logger = setup_logger("unique_strategy")
 
 # Cache configuration
 CACHE_TTL = 60
-CONFIG_CACHE_TTL = 300
+CONFIG_CACHE_TTL = 60 # Reduced from 300 for faster config updates
 
 @dataclass
 class CacheEntry:
@@ -42,6 +71,7 @@ class CacheEntry:
 
 _api_cache: Dict[str, CacheEntry] = {}
 _config_cache: Dict[str, CacheEntry] = {}
+_loan_alerts: Dict[str, Dict[str, Any]] = {} # {token: {"last_alert": float, "alert_count": int, "missing_since": float | None}}
 
 def get_cached_data(cache_key: str, cache_dict: Dict[str, CacheEntry]) -> Optional[Any]:
     if cache_key in cache_dict:
@@ -61,13 +91,20 @@ def get_unique_strategy_config(config_key="1hour_manipulation"):
         client = MongoClient(MONGO_URI)
         db = client[DB_NAME]
         col = db[COLLECTION_NAME]
+        
         doc = col.find_one({"global_tracking": True})
         client.close()
-        result = doc.get(config_key, []) if doc else []
+        
+        if not doc:
+            logger.warning(f"No document found with global_tracking: True in {DB_NAME}.{COLLECTION_NAME}")
+            return []
+            
+        logger.info(f"Config for {config_key} successfully fetched. Available keys in doc: {list(doc.keys())}")
+        result = doc.get(config_key, [])
         set_cache_data(cache_key, result, CONFIG_CACHE_TTL, _config_cache)
         return result
     except Exception as e:
-        logger.error(f"Error fetching unique strategy config ({config_key}): {e}")
+        logger.error(f"Error fetching unique strategy config ({config_key}) from {DB_NAME}.{COLLECTION_NAME}: {e}")
         return []
 
 def calculate_candle_volatility(candle, api):
@@ -101,13 +138,15 @@ async def check_1hour_manipulation():
                 red_threshold = cfg.get("red_candles", 5)
                 
                 api = get_exchange_api(exchange)
+                formatted_symbol = format_unique_symbol(symbol, exchange)
                 # Fetch more than needed to ensure we have enough history
-                candles = await api.fetch_klines(session, symbol, str(timeframe), red_threshold + 5)
+                candles = await api.fetch_klines(session, formatted_symbol, str(timeframe), red_threshold + 5, category="linear")
                 
                 if not candles or len(candles) < red_threshold + 1: continue
                 
-                # Bybit returns newest first, Binance oldest first. Let's normalize to newest first for logic.
-                if exchange.lower() == "binance":
+                # Standardize: Bybit returns newest first, others might return oldest first.
+                # All except Bybit and Hyperliquid usually return oldest first.
+                if exchange.lower() not in ["bybit", "hyperliquid"]:
                     candles = candles[::-1]
                 
                 last_completed = candles[1]
@@ -126,13 +165,14 @@ async def check_1hour_manipulation():
                         price_change = ((c - o) / o) * 100
                         direction = "📉" if c < o else "📈"
                         msg = (f"🔴 UNIQUE STRATEGY: 1 HOUR MANIPULATION!\n\n"
-                               f"🎯 Symbol: {symbol} ({exchange.upper()})\n"
-                               f"⏰ Candle Time: {candle_time}\n"
-                               f"📊 Consecutive Red: {consecutive_red}\n"
-                               f"⚡ Volatility: {volatility:.4%}\n"
-                               f"📉 Price Change: {price_change:.2f}%\n"
-                               f"{direction} O:{o} -> C:{c}\n"
-                               f"💡 Strategy: Found {red_threshold}+ red candles and high volatility.")
+                                f"🎯 Symbol: {symbol} ({formatted_symbol})\n"
+                                f"🏛 Exchange: {exchange.upper()}\n"
+                                f"⏰ Candle Time: {candle_time}\n"
+                                f"📊 Consecutive Red: {consecutive_red}\n"
+                                f"⚡ Volatility: {volatility:.4%}\n"
+                                f"📉 Price Change: {price_change:.2f}%\n"
+                                f"{direction} O:{o} -> C:{c}\n"
+                                f"💡 Strategy: Found {red_threshold}+ red candles and high volatility.")
                         
                         await TelegramManager.send_message(TOKEN, CHAT_IDS, msg)
                         set_cache_data(cache_key, True, 3600, _api_cache)
@@ -175,16 +215,16 @@ async def spot_futures_manipulation():
                     symbols_to_check = [symbol_cfg]
                 for symbol in symbols_to_check:
                     try:
-                        logger.info(f"Checking {symbol} for spot/futures manipulation on {exchange_name}...")
+                        formatted_symbol = format_unique_symbol(symbol, exchange_name)
+                        logger.info(f"Checking {symbol} ({formatted_symbol}) for spot/futures manipulation on {exchange_name}...")
                         # Fetch enough candles for both detection and volume average
-                        candles = await api.fetch_klines(session, symbol, str(timeframe), max(green_threshold, vol_avg_period) + 5, category=market_type)
+                        candles = await api.fetch_klines(session, formatted_symbol, str(timeframe), max(green_threshold, vol_avg_period) + 5, category=market_type)
                         if not candles or len(candles) < max(green_threshold, vol_avg_period) + 1: continue
                         
                         # Normalize: newest first
                         if not isinstance(candles, list): continue
                         processed_candles = [c for c in candles]
-                        if exchange_name.lower() in ["binance", "okx", "bitget", "bingx"]:
-                            # Most return oldest first (Binance). Bybit returns newest first.
+                        if exchange_name.lower() not in ["bybit", "hyperliquid"]:
                             processed_candles.reverse()
                         
                         # Conditions:
@@ -248,12 +288,13 @@ async def spot_futures_manipulation():
                             
                             if get_cached_data(cache_key, _api_cache) is None:
                                 msg = (f"🚀 SPOT/FUTURES MANIPULATION! ({market_type.upper()})\n\n"
-                                       f"🎯 Symbol: {symbol} ({exchange_name.upper()})\n"
-                                       f"⏰ Time: {candle_time}\n"
-                                       f"📊 Consecutive Green: {green_threshold}\n"
-                                       f"📈 Breaking Highs: {'Yes' if strict_highs else 'No'}\n"
-                                       f"🔊 Volume: {v_curr:.2f} (Avg: {avg_vol:.2f}, x{v_curr/avg_vol:.1f})\n"
-                                       f"⚡ Status: Slow pump detected on {timeframe}m timeframe.")
+                                        f"🎯 Symbol: {symbol} ({formatted_symbol})\n"
+                                        f"🏛 Exchange: {exchange_name.upper()}\n"
+                                        f"⏰ Time: {candle_time}\n"
+                                        f"📊 Consecutive Green: {green_threshold}\n"
+                                        f"📈 Breaking Highs: {'Yes' if strict_highs else 'No'}\n"
+                                        f"🔊 Volume: {v_curr:.2f} (Avg: {avg_vol:.2f}, x{v_curr/avg_vol:.1f})\n"
+                                        f"⚡ Status: Slow pump detected on {timeframe}m timeframe.")
                                 
                                 await TelegramManager.send_message(TOKEN, CHAT_IDS, msg)
                                 set_cache_data(cache_key, True, 300, _api_cache)
@@ -264,6 +305,13 @@ async def spot_futures_manipulation():
         except Exception as e:
             logger.error(f"Error in spot_futures_manipulation loop: {e}")
         await asyncio.sleep(60)
+
+async def get_bybit_remaining_quota(session, coin):
+    """Checks the actual remaining platform quota for a specific coin."""
+    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        return 0.0
+        
+
 
 async def run_unique_strategy():
     logger.info("Starting Unique Strategy Monitor...")

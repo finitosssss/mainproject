@@ -20,6 +20,25 @@ logger = setup_logger("funding_monitor")
 FUNDING_BOT_TOKEN = os.getenv("FUNDING_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHAT_IDS = [TELEGRAM_CHAT_ID] if TELEGRAM_CHAT_ID else []
+ 
+def format_funding_symbol(symbol: str, exchange: str) -> str:
+    exchange = exchange.lower().strip()
+    if exchange in ["bybit", "binance", "asterdex", "bitget", "bitmart"]:
+        return f"{symbol}USDT"
+    if exchange == "okx":
+        return f"{symbol}-USDT-SWAP"
+    if exchange == "kucoin":
+        return f"{symbol}USDTM"
+    if exchange == "bingx":
+        return f"{symbol}-USDT"
+    if exchange in ["gate", "mexc"]:
+        return f"{symbol}_USDT"
+    if exchange == "htx":
+        return f"{symbol}-USDT"
+    if exchange == "hyperliquid":
+        return symbol # Hyperliquid uses just the base name for perps
+    return f"{symbol}USDT"
+
 
 async def send_funding_message(message):
     try:
@@ -130,7 +149,8 @@ async def check_funding_rates():
 
                 for exchange in token_config.get("exchanges", []):
                     # rate: Optional[float], next_time_ms: Optional[int]
-                    rate_data = await get_funding_rate(exchange, token)
+                    formatted_symbol = format_funding_symbol(token, exchange)
+                    rate_data = await get_funding_rate(exchange, formatted_symbol)
                     rate, next_time_ms = rate_data
                     if rate is not None:
                         funding_rates[exchange] = rate

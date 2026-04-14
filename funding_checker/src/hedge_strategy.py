@@ -20,6 +20,24 @@ logger = setup_logger("hedge_strategy")
 HEDGE_BOT_TOKEN = os.getenv("HEDGE_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHAT_IDS = [TELEGRAM_CHAT_ID] if TELEGRAM_CHAT_ID else []
+ 
+def format_hedge_symbol(symbol: str, exchange: str) -> str:
+    exchange = exchange.lower().strip()
+    if exchange in ["bybit", "binance", "asterdex", "bitget", "bitmart"]:
+        return f"{symbol}USDT"
+    if exchange == "okx":
+        return f"{symbol}-USDT-SWAP"
+    if exchange == "kucoin":
+        return f"{symbol}USDTM"
+    if exchange == "bingx":
+        return f"{symbol}-USDT"
+    if exchange in ["gate", "mexc"]:
+        return f"{symbol}_USDT"
+    if exchange == "htx":
+        return f"{symbol}-USDT"
+    if exchange == "hyperliquid":
+        return symbol # Hyperliquid uses just the base name for perps
+    return f"{symbol}USDT"
 
 async def send_hedge_message(message):
     try:
@@ -133,18 +151,20 @@ config_manager = ConfigManager()
 
 async def get_funding_rate(exchange_name, symbol):
     try:
+        formatted_symbol = format_hedge_symbol(symbol, exchange_name)
         api = get_exchange_api(exchange_name)
         session = await SessionManager.get_session()
-        return await api.fetch_funding_rate(session, symbol)
+        return await api.fetch_funding_rate(session, formatted_symbol)
     except Exception as e:
         logger.error(f"Error fetching funding rate from {exchange_name} for {symbol}: {e}")
     return None
 
 async def get_current_price(exchange_name, symbol):
     try:
+        formatted_symbol = format_hedge_symbol(symbol, exchange_name)
         api = get_exchange_api(exchange_name)
         session = await SessionManager.get_session()
-        return await api.fetch_ticker_price(session, symbol)
+        return await api.fetch_ticker_price(session, formatted_symbol)
     except Exception as e:
         logger.error(f"Error fetching price from {exchange_name} for {symbol}: {e}")
     return None

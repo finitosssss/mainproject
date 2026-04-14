@@ -9,10 +9,10 @@ from funding_monitor import run_funding_monitor
 async def main():
     await asyncio.gather(
         #run_hedge_strategy(),
-        #run_volume_tracker(),
+        run_volume_tracker(),
         #run_trading_tools(),
-        #run_unique_strategy(),
-        run_funding_monitor()
+        run_unique_strategy(),
+        #run_funding_monitor()
     )
 
 if __name__ == "__main__":

@@ -24,6 +24,24 @@ COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME_TRADING_TOOLS", "binance_alph
 TOKEN = os.getenv("TRADING_TOOLS_TOKEN")
 CHAT_IDS = os.getenv("TRADING_TOOLS_CHAT_IDS", "").split(",")
 
+def format_trading_tools_symbol(symbol: str, exchange: str) -> str:
+    exchange = exchange.lower().strip()
+    if exchange in ["bybit", "binance", "asterdex", "bitget", "bitmart"]:
+        return f"{symbol}USDT"
+    if exchange == "okx":
+        return f"{symbol}-USDT-SWAP"
+    if exchange == "kucoin":
+        return f"{symbol}USDTM"
+    if exchange == "bingx":
+        return f"{symbol}-USDT"
+    if exchange in ["gate", "mexc"]:
+        return f"{symbol}_USDT"
+    if exchange == "htx":
+        return f"{symbol}-USDT"
+    if exchange == "hyperliquid":
+        return symbol # Hyperliquid uses just the base name for perps
+    return f"{symbol}USDT"
+
 # Logging configuration
 logger = setup_logger("trading_tools")
 
@@ -65,19 +83,6 @@ def get_trading_tools_config_from_mongo():
     try:
         client = MongoClient(MONGO_URI)
         db = client[DB_NAME]
-        col = db[COLLECTION_NAME]
-        doc = col.find_one({"global_tracking": True})
-        client.close()
-        result = doc.get("flash_crush", []) if doc else []
-        set_cache_data("trading_tools_config", result, CONFIG_CACHE_TTL, _config_cache)
-        return result
-    except Exception as e:
-        logger.error(f"Error fetching trading tools config: {e}")
-        return []
-    
-    try:
-        client = MongoClient(MONGO_URI)
-        db = client[DB_NAME]
         collection = db[COLLECTION_NAME]
         # Search for any document with global_tracking: True
         doc = collection.find_one({"global_tracking": True})
@@ -86,14 +91,7 @@ def get_trading_tools_config_from_mongo():
         result = []
         
         if doc:
-            # Check global tracking flag
-            global_tracking = doc.get("global_tracking", True)
-            if not global_tracking:
-                logger.info("Global tracking is disabled, returning empty trading tools config")
-                set_cache_data("trading_tools_config", result, CONFIG_CACHE_TTL, _config_cache)
-                return result
-            
-            # Process flash_crush_strategy
+            # Processing flash_crush_strategy
             if "flash_crush_strategy" in doc:
                 strategies = doc["flash_crush_strategy"]
                 for strategy in strategies:
@@ -101,6 +99,7 @@ def get_trading_tools_config_from_mongo():
                         strategy_config = {
                             "strategy_type": "flash_crush",
                             "symbol": strategy.get("symbol"),
+                            "exchange": strategy.get("exchange", "bybit"),
                             "timeframe": strategy.get("timeframe", 1),
                             "min_volatility": strategy.get("min_volatility", 0.002),
                             "volume": strategy.get("volume", 30000),
@@ -540,6 +539,7 @@ async def check_trading_tools_strategies():
                         macd_histogram_threshold = strategy["macd_histogram_threshold"]
                         macd_zero_cross_confirmation = strategy["macd_zero_cross_confirmation"]
                         
+                        # Required candles for analysis
                         required_candles = 3
                         if rsi_enabled:
                             required_candles = max(required_candles, rsi_period + 5)
@@ -549,10 +549,11 @@ async def check_trading_tools_strategies():
                             else:
                                 required_candles = max(required_candles, macd_slow + macd_signal + 5)
                         
-                        candles = await api.fetch_klines(session, symbol, api_interval, required_candles)
+                        formatted_symbol = format_trading_tools_symbol(symbol, exchange)
+                        candles = await api.fetch_klines(session, formatted_symbol, api_interval, required_candles, category="linear")
                         
                         if not candles or len(candles) < 2:
-                            logger.warning(f"Not enough candle data for {symbol} on {exchange} {timeframe}m")
+                            logger.warning(f"Not enough candle data for {symbol} ({formatted_symbol}) on {exchange} {timeframe}m")
                             continue
                         
                         # Normalize to newest first for logic
@@ -652,6 +653,7 @@ async def check_trading_tools_strategies():
                                 await TelegramManager.send_message(TOKEN, CHAT_IDS, alert_msg)
                                 set_cache_data(cache_key, True, timeframe * 60, _api_cache)
                     
+
                                 
                 except Exception as e:
                     logger.error(f"Error processing strategy for {symbol}: {e}")

@@ -64,7 +64,8 @@ class BybitAPI(ExchangeAPI):
                 if resp.status == 200:
                     data = await resp.json()
                     return set([item["symbol"] for item in data.get("result", {}).get("list", [])])
-        except Exception: pass
+        except Exception as e:
+            logger.error(f"Error in BybitAPI.get_available_symbols: {e}")
         return set()
 
     async def fetch_recent_trades(self, session, symbol, limit):
@@ -163,7 +164,9 @@ class BinanceAPI(ExchangeAPI):
                         return set([item["symbol"] for item in data.get("symbols", []) if item.get("status") == "TRADING" and item.get("isSpotTradingAllowed")])
                     else:
                         return set([item["symbol"] for item in data.get("symbols", []) if item.get("status") == "TRADING"])
-        except Exception: return set()
+        except Exception as e:
+            logger.error(f"Error in BinanceAPI.get_available_symbols: {e}")
+            return set()
         return set()
 
     async def fetch_recent_trades(self, session, symbol, limit):
@@ -260,7 +263,8 @@ class OKXAPI(ExchangeAPI):
                 if resp.status == 200:
                     data = await resp.json()
                     return set([item["instId"] for item in data.get("data", []) if item.get("state") == "live"])
-        except: pass
+        except Exception as e:
+            logger.error(f"Error in OKXAPI.get_available_symbols: {e}")
         return set()
 
     async def fetch_recent_trades(self, session, symbol, limit):
@@ -422,6 +426,22 @@ class BitmartAPI(ExchangeAPI):
                 return symbol, bids, asks
         except Exception: pass
         return None, [], []
+
+    async def fetch_funding_rate(self, session, symbol):
+        # Bitmart Futures V2 API
+        url = f"https://api-cloud-v2.bitmart.com/contract/public/funding-rate?symbol={symbol}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("code") == 1000:
+                        item = data["data"]
+                        rate = float(item["funding_rate"]) * 100
+                        # Bitmart returns funding_time as timestamp ms
+                        next_time = int(item.get("funding_time", 0))
+                        return rate, next_time
+        except Exception: pass
+        return None, None
 
 class BitgetAPI(ExchangeAPI):
     def __init__(self):
@@ -609,9 +629,64 @@ class BingXAPI(ExchangeAPI):
         except Exception: pass
         return None, [], []
 
+    async def fetch_funding_rate(self, session, symbol):
+        # BingX Swap V2 API
+        url = f"https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex?symbol={symbol}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("code") == 0:
+                        item = data["data"]
+                        rate = float(item["lastFundingRate"]) * 100
+                        next_time = int(item.get("nextFundingTime", 0))
+                        return rate, next_time
+        except Exception: pass
+        return None, None
+
 class MEXCAPI(ExchangeAPI):
     def __init__(self):
         super().__init__("mexc")
+
+    async def get_available_symbols(self, session, category="spot"):
+        url = "https://api.mexc.com/api/v3/exchangeInfo"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return set([item["symbol"] for item in data.get("symbols", []) if item.get("status") == "ENABLED"])
+        except: pass
+        return set()
+
+    async def fetch_recent_trades(self, session, symbol, limit):
+        url = f"https://api.mexc.com/api/v3/trades?symbol={symbol}&limit={limit}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except: pass
+        return []
+
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
+        interval_map = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h", "D": "1d", "240": "4h"}
+        mexc_interval = interval_map.get(str(interval), "1m")
+        url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval={mexc_interval}&limit={limit}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except: pass
+        return []
+
+    def parse_kline(self, kline):
+        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4]), float(kline[5])
+        except: return None, None, None, None, None, None
+
+    def parse_trade(self, trade):
+        try:
+            side = 'Sell' if trade.get('isBuyerMaker') else 'Buy'
+            return float(trade.get('price', 0)), float(trade.get('qty', 0)), float(trade.get('time', 0)), side
+        except: return None, None, None, None
 
     async def fetch_funding_rate(self, session, symbol):
         url = f"https://contract.mexc.com/api/v1/contract/funding_rate?symbol={symbol}_USDT"
@@ -640,6 +715,49 @@ class KuCoinAPI(ExchangeAPI):
     def __init__(self):
         super().__init__("kucoin")
 
+    async def get_available_symbols(self, session, category="spot"):
+        url = "https://api.kucoin.com/api/v1/symbols"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return set([item["symbol"] for item in data.get("data", []) if item.get("enableTrading")])
+        except: pass
+        return set()
+
+    async def fetch_recent_trades(self, session, symbol, limit):
+        url = f"https://api.kucoin.com/api/v1/market/histories?symbol={symbol}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get('data', [])
+        except: pass
+        return []
+
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
+        interval_map = {"1": "1min", "5": "5min", "15": "15min", "30": "30min", "60": "1hour", "D": "1day", "240": "4hour"}
+        ku_interval = interval_map.get(str(interval), "1min")
+        url = f"https://api.kucoin.com/api/v1/market/candles?symbol={symbol}&type={ku_interval}&limit={limit}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get('data', [])
+        except: pass
+        return []
+
+    def parse_kline(self, kline):
+        try: # KuCoin: [time, open, close, high, low, volume, amount]
+            return float(kline[0]) * 1000, float(kline[1]), float(kline[3]), float(kline[4]), float(kline[2]), float(kline[5])
+        except: return None, None, None, None, None, None
+
+    def parse_trade(self, trade):
+        try:
+            side = 'Buy' if trade.get('side') == 'buy' else 'Sell'
+            return float(trade.get('price', 0)), float(trade.get('size', 0)), float(trade.get('time', 0)) / 1000000, side
+        except: return None, None, None, None
+
     async def fetch_funding_rate(self, session, symbol):
         url = f"https://api-futures.kucoin.com/api/v1/funding-rate/{symbol}USDTM/current"
         try:
@@ -663,6 +781,307 @@ class KuCoinAPI(ExchangeAPI):
         except Exception: pass
         return None
 
+class GateAPI(ExchangeAPI):
+    def __init__(self):
+        super().__init__("gate")
+
+    async def get_available_symbols(self, session, category="spot"):
+        url = "https://api.gateio.ws/api/v4/spot/currency_pairs"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return set([item["id"] for item in data if item.get("trade_status") == "tradable"])
+        except: pass
+        return set()
+
+    async def fetch_recent_trades(self, session, symbol, limit):
+        url = f"https://api.gateio.ws/api/v4/spot/trades?currency_pair={symbol}&limit={limit}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except: pass
+        return []
+
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
+        interval_map = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h", "D": "1d", "240": "4h"}
+        gate_interval = interval_map.get(str(interval), "1m")
+        url = f"https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair={symbol}&interval={gate_interval}&limit={limit}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+        except: pass
+        return []
+
+    def parse_kline(self, kline):
+        try: # Gate: [ts, volume, close, high, low, open]
+            return float(kline[0]) * 1000, float(kline[5]), float(kline[3]), float(kline[4]), float(kline[2]), float(kline[1])
+        except: return None, None, None, None, None, None
+
+    def parse_trade(self, trade):
+        try:
+            return float(trade.get('price', 0)), float(trade.get('amount', 0)), float(trade.get('create_time', 0)) * 1000, trade.get('side').capitalize()
+        except: return None, None, None, None
+
+    async def fetch_funding_rate(self, session, symbol):
+        url = f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{symbol}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    rate = float(data.get("funding_rate", 0)) * 100
+                    next_time = int(data.get("funding_next_apply", 0)) * 1000
+                    return rate, next_time
+        except Exception: pass
+        return None, None
+
+    async def fetch_ticker_price(self, session, symbol):
+        url = f"https://api.gateio.ws/api/v4/futures/usdt/tickers?contract={symbol}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        return float(data[0].get("last", 0))
+        except Exception: pass
+        return None
+
+class HTXAPI(ExchangeAPI):
+    def __init__(self):
+        super().__init__("htx")
+
+    async def get_available_symbols(self, session, category="spot"):
+        url = "https://api.huobi.pro/v1/common/symbols"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return set([item["symbol"] for item in data.get("data", []) if item.get("state") == "online"])
+        except: pass
+        return set()
+
+    async def fetch_recent_trades(self, session, symbol, limit):
+        url = f"https://api.huobi.pro/market/history/trade?symbol={symbol}&size={limit}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    trades = []
+                    for item in data.get('data', []):
+                        trades.extend(item.get('data', []))
+                    return trades
+        except: pass
+        return []
+
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
+        interval_map = {"1": "1min", "5": "5min", "15": "15min", "30": "30min", "60": "60min", "D": "1day", "240": "4hour"}
+        htx_interval = interval_map.get(str(interval), "1min")
+        url = f"https://api.huobi.pro/market/history/kline?symbol={symbol}&period={htx_interval}&size={limit}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get('data', [])
+        except: pass
+        return []
+
+    def parse_kline(self, kline):
+        try: return float(kline.get('id', 0)) * 1000, float(kline.get('open', 0)), float(kline.get('high', 0)), float(kline.get('low', 0)), float(kline.get('close', 0)), float(kline.get('vol', 0))
+        except: return None, None, None, None, None, None
+
+    def parse_trade(self, trade):
+        try:
+            return float(trade.get('price', 0)), float(trade.get('amount', 0)), float(trade.get('ts', 0)), trade.get('side').capitalize()
+        except: return None, None, None, None
+
+    async def fetch_funding_rate(self, session, symbol):
+        url = f"https://api.huobi.pro/linear-swap-api/v1/swap_funding_rate?contract_code={symbol}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    item = data.get("data", {})
+                    rate = float(item.get("funding_rate", 0)) * 100
+                    next_time = int(item.get("funding_time", 0))
+                    return rate, next_time
+        except Exception: pass
+        return None, None
+
+    async def fetch_ticker_price(self, session, symbol):
+        url = f"https://api.huobi.pro/linear-swap-api/v1/swap_ticker?contract_code={symbol}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    item = data.get("tick", {})
+                    return float(item.get("close", 0))
+        except Exception: pass
+        return None
+
+class HyperliquidAPI(ExchangeAPI):
+    def __init__(self):
+        super().__init__("hyperliquid")
+        self.spot_meta_cache = {}
+
+    async def _get_spot_meta(self, session):
+        if not self.spot_meta_cache:
+            url = "https://api.hyperliquid.xyz/info"
+            payload = {"type": "spotMeta"}
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for i, token in enumerate(data.get("tokens", [])):
+                            name = token.get("name")
+                            if name:
+                                self.spot_meta_cache[name] = f"@{i}"
+            except: pass
+        return self.spot_meta_cache
+
+    async def get_available_symbols(self, session, category="spot"):
+        meta = await self._get_spot_meta(session)
+        return set(meta.keys())
+
+    async def fetch_recent_trades(self, session, symbol, limit):
+        meta = await self._get_spot_meta(session)
+        coin = meta.get(symbol)
+        if not coin: return []
+        url = "https://api.hyperliquid.xyz/info"
+        payload = {"type": "recentTrades", "coin": coin}
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200: return await resp.json()
+        except: pass
+        return []
+
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
+        meta = await self._get_spot_meta(session)
+        coin = meta.get(symbol)
+        if not coin: return []
+        interval_map = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h", "D": "1d", "240": "4h"}
+        hl_interval = interval_map.get(str(interval), "1m")
+        url = "https://api.hyperliquid.xyz/info"
+        payload = {"type": "candleSnapshot", "req": {"coin": coin, "interval": hl_interval}}
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200: return await resp.json()
+        except: pass
+        return []
+
+    def parse_kline(self, kline):
+        try: # HL: t (open time), T (close time), o, h, l, c, v
+            return float(kline.get('t', 0)), float(kline.get('o', 0)), float(kline.get('h', 0)), float(kline.get('l', 0)), float(kline.get('c', 0)), float(kline.get('v', 0))
+        except: return None, None, None, None, None, None
+
+    def parse_trade(self, trade):
+        try: # HL: px, sz, side (A/B), time, tid
+            side = 'Buy' if trade.get('side') == 'B' else 'Sell'
+            return float(trade.get('px', 0)), float(trade.get('sz', 0)), float(trade.get('time', 0)), side
+        except: return None, None, None, None
+
+    async def fetch_funding_rate(self, session, symbol):
+        url = "https://api.hyperliquid.xyz/info"
+        payload = {"type": "metaAndAssetCtx"}
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # data is [meta, assetCtxs]
+                    meta = data[0]
+                    asset_ctxs = data[1]
+                    for i, m in enumerate(meta.get("universe", [])):
+                        if m.get("name") == symbol:
+                            ctx = asset_ctxs[i]
+                            rate = float(ctx.get("funding", 0)) * 100
+                            # HL doesn't provide exact next funding time in this endpoint, 
+                            # but usually it's every hour.
+                            return rate, int(time.time() * 1000) + 3600000
+        except Exception: pass
+        return None, None
+
+    async def fetch_ticker_price(self, session, symbol):
+        url = "https://api.hyperliquid.xyz/info"
+        payload = {"type": "metaAndAssetCtx"}
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    meta = data[0]
+                    asset_ctxs = data[1]
+                    for i, m in enumerate(meta.get("universe", [])):
+                        if m.get("name") == symbol:
+                            return float(asset_ctxs[i].get("markPx", 0))
+        except Exception: pass
+        return None
+
+class AsterdexAPI(ExchangeAPI):
+    def __init__(self):
+        super().__init__("asterdex")
+
+    async def get_available_symbols(self, session, category="spot"):
+        url = "https://api.asterdex.com/fapi/v1/exchangeInfo"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return set([item["symbol"] for item in data.get("symbols", [])])
+        except: pass
+        return set()
+
+    async def fetch_recent_trades(self, session, symbol, limit):
+        url = f"https://api.asterdex.com/fapi/v1/trades?symbol={symbol}&limit={limit}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200: return await resp.json()
+        except: pass
+        return []
+
+    async def fetch_klines(self, session, symbol, interval, limit, category="spot"):
+        interval_map = {"1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h", "D": "1d", "240": "4h"}
+        ast_interval = interval_map.get(str(interval), "1m")
+        url = f"https://api.asterdex.com/fapi/v1/klines?symbol={symbol}&interval={ast_interval}&limit={limit}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200: return await resp.json()
+        except: pass
+        return []
+
+    def parse_kline(self, kline):
+        try: return float(kline[0]), float(kline[1]), float(kline[2]), float(kline[3]), float(kline[4]), float(kline[5])
+        except: return None, None, None, None, None, None
+
+    def parse_trade(self, trade):
+        try:
+            side = 'Buy' if trade.get('isBuyerMaker', False) is False else 'Sell'
+            return float(trade.get('price', 0)), float(trade.get('qty', 0)), float(trade.get('time', 0)), side
+        except: return None, None, None, None
+
+    async def fetch_funding_rate(self, session, symbol):
+        url = f"https://api.asterdex.com/fapi/v1/premiumIndex?symbol={symbol}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    rate = float(data.get("lastFundingRate", 0)) * 100
+                    next_time = int(data.get("nextFundingTime", 0))
+                    return rate, next_time
+        except Exception: pass
+        return None, None
+
+    async def fetch_ticker_price(self, session, symbol):
+        url = f"https://api.asterdex.com/fapi/v1/ticker/price?symbol={symbol}"
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return float(data.get("price", 0))
+        except Exception: pass
+        return None
+
+
+
 def get_exchange_api(name: str) -> ExchangeAPI:
     name = name.lower().strip()
     if name == "bybit": return BybitAPI()
@@ -673,4 +1092,8 @@ def get_exchange_api(name: str) -> ExchangeAPI:
     if name == "bingx": return BingXAPI()
     if name == "mexc": return MEXCAPI()
     if name == "kucoin": return KuCoinAPI()
+    if name == "gate": return GateAPI()
+    if name == "htx": return HTXAPI()
+    if name == "hyperliquid": return HyperliquidAPI()
+    if name == "asterdex": return AsterdexAPI()
     return BybitAPI()

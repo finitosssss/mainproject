@@ -31,7 +31,7 @@ logger = setup_logger("volume_tracker")
 
 # Cache configuration
 CACHE_TTL = 60
-CONFIG_CACHE_TTL = 300
+CONFIG_CACHE_TTL = 60
 
 @dataclass
 class CacheEntry:
@@ -44,6 +44,7 @@ class CacheEntry:
 
 _api_cache: Dict[str, CacheEntry] = {}
 _config_cache: Dict[str, CacheEntry] = {}
+_active_monitors: Dict[str, asyncio.Task] = {}
 
 def get_cached_data(cache_key: str, cache_dict: Dict[str, CacheEntry]) -> Optional[Any]:
     if cache_key in cache_dict:
@@ -69,9 +70,15 @@ def get_all_exchanges_config_from_mongo() -> List[Dict]:
         
         results = []
         for doc in docs:
-            exchange_name = doc.get("exchange", "bybit")
-            doc["exchange"] = exchange_name.lower().strip()
-            results.append(doc)
+            # Support both string and list of exchanges
+            exchanges = doc.get("exchange", doc.get("exchanges", "bybit"))
+            if isinstance(exchanges, str):
+                exchanges = [exchanges]
+            
+            for ex in exchanges:
+                new_doc = doc.copy()
+                new_doc["exchange"] = ex.lower().strip()
+                results.append(new_doc)
             
         set_cache_data("all_exchange_configs", results, CONFIG_CACHE_TTL, _config_cache)
         return results
@@ -79,25 +86,57 @@ def get_all_exchanges_config_from_mongo() -> List[Dict]:
         logger.error(f"Error fetching configs from Mongo: {e}")
         return []
 
+def format_symbol_for_exchange(symbol: str, exchange: str) -> str:
+    if not symbol: return symbol
+    exchange = exchange.lower().strip()
+    # OKX, KuCoin and BingX common format: EDGE-USDT
+    if exchange in ["okx", "kucoin", "bingx"]:
+        if "USDT" in symbol and "-" not in symbol:
+            return symbol.replace("USDT", "-USDT")
+    # MEXC, Gate and Bitmart often use underscore: EDGE_USDT
+    if exchange in ["mexc", "gate", "bitmart"]:
+        if "USDT" in symbol and "_" not in symbol:
+            return symbol.replace("USDT", "_USDT")
+    # HTX uses lowercase: edgeusdt
+    if exchange == "htx":
+        return symbol.lower()
+    # Hyperliquid Spot uses just the base name: EDGE
+    if exchange == "hyperliquid":
+        if "USDT" in symbol:
+            return symbol.replace("USDT", "")
+    return symbol
+
 def get_watchlist_for_exchange(exchange_doc: Dict) -> List[str]:
     result = []
+    exchange = exchange_doc.get("exchange", "bybit").lower()
     if "tokens" in exchange_doc:
         tokens = exchange_doc["tokens"]
-        if len(tokens) > 0 and isinstance(tokens[0], str):
-            result = tokens
-        else:
-            result = [t["symbol"] for t in tokens if t.get("enabled", True)]
+        for t in tokens:
+            if isinstance(t, str):
+                symbol = t
+                enabled = True
+            else:
+                symbol = t.get(f"{exchange}_symbol", t.get("symbol"))
+                enabled = t.get("enabled", True)
+            
+            if symbol and enabled:
+                formatted = format_symbol_for_exchange(symbol, exchange)
+                if formatted:
+                    result.append(formatted)
     return result
 
 def get_token_config_for_exchange(exchange_doc: Dict) -> Dict:
     result = {}
+    exchange = exchange_doc.get("exchange", "bybit").lower()
     
     if "tokens" in exchange_doc:
         for token in exchange_doc["tokens"]:
             if isinstance(token, str):
                 continue
             else:
-                symbol = token.get("symbol")
+                raw_symbol = token.get(f"{exchange}_symbol", token.get("symbol"))
+                symbol = format_symbol_for_exchange(raw_symbol, exchange)
+                
                 enabled = token.get("enabled", True)
                 if symbol and enabled:
                     config = {
@@ -105,6 +144,7 @@ def get_token_config_for_exchange(exchange_doc: Dict) -> Dict:
                         "volatility": token.get("volatility", 0.0),
                         "enabled": enabled
                     }
+                    
                     if "green_candles" in token:
                         config["green_candles"] = token["green_candles"]
                     if "volty_handels" in token:
@@ -124,7 +164,7 @@ def get_token_config_for_exchange(exchange_doc: Dict) -> Dict:
 # Exchange API implementations are now imported from utils.exchanges
 
 def calculate_candle_volatility(candle, api: ExchangeAPI):
-    ts, o, h, l, c = api.parse_kline(candle)
+    ts, o, h, l, c, _ = api.parse_kline(candle)
     if l is not None and h is not None and l > 0:
         return (h - l) / l
     return 0.0
@@ -134,7 +174,7 @@ def analyze_green_candles_with_volatility(api: ExchangeAPI, candles, required_co
     if len(volatility_thresholds) != required_count: return False, []
     parsed_candles = []
     for c in candles:
-        parsed = api.parse_kline_format(c)
+        parsed = api.parse_kline(c)
         if parsed[0] is not None:
             parsed_candles.append((c, parsed))
     sorted_candles = sorted(parsed_candles, key=lambda x: x[1][0], reverse=True)
@@ -144,7 +184,7 @@ def analyze_green_candles_with_volatility(api: ExchangeAPI, candles, required_co
     for i in range(1, min(required_count + 1, len(sorted_candles))):
         raw_c, parsed = sorted_candles[i]
         threshold_index = i - 1
-        ts, o, h, l, c = parsed
+        ts, o, h, l, c, _ = parsed
         if o is None or c is None:
             volatility_conditions_met = False
             break
@@ -177,7 +217,7 @@ async def check_green_candles_for_symbols(api: ExchangeAPI, symbols_config):
         volatility_thresholds = green_config.get('volatility_thresholds', [])
         if required_count <= 0 or not volatility_thresholds: continue
         try:
-            candles = await api.fetch_kline_data(session, symbol, interval="1", limit=required_count + 3)
+            candles = await api.fetch_klines(session, symbol, interval="1", limit=required_count + 3)
             if not candles: continue
             pattern_found, candle_details = analyze_green_candles_with_volatility(api, candles, required_count, volatility_thresholds)
             if pattern_found:
@@ -197,11 +237,11 @@ async def check_solo_volatility_for_symbols(api: ExchangeAPI, symbols_config):
         threshold = config['volty_handels']
         if threshold <= 0: continue
         try:
-            candles = await api.fetch_kline_data(session, symbol, interval="1", limit=5)
+            candles = await api.fetch_klines(session, symbol, interval="1", limit=5)
             if not candles or len(candles) < 4: continue
             parsed_candles = []
             for c in candles:
-                parsed = api.parse_kline_format(c)
+                parsed = api.parse_kline(c)
                 if parsed[0] is not None:
                     parsed_candles.append((c, parsed))
             sorted_candles = sorted(parsed_candles, key=lambda x: x[1][0], reverse=True)
@@ -256,7 +296,7 @@ async def check_token_transactions_for_symbols(api: ExchangeAPI, symbols_config)
         if cached is not None:
             all_trades[symbol] = cached
         else:
-            trades = await api.fetch_recent_trades_single(session, symbol, 100)
+            trades = await api.fetch_recent_trades(session, symbol, 100)
             all_trades[symbol] = trades
             set_cache_data(cache_key, trades, CACHE_TTL, _api_cache)
 
@@ -269,7 +309,7 @@ async def check_token_transactions_for_symbols(api: ExchangeAPI, symbols_config)
             current_time = time.time()
             ten_mins_ago = (current_time - 600) * 1000
             for t in trades:
-                price, size, ts, side = api.parse_trade_history(t)
+                price, size, ts, side = api.parse_trade(t)
                 if price is None: continue
                 if ts < ten_mins_ago: continue
                 if price > 0:
@@ -309,67 +349,75 @@ async def check_volume_rest_for_exchange(exchange_doc: Dict):
             current_doc = next((d for d in all_configs if d.get("exchange", "bybit") == exchange_name), exchange_doc)
             watchlist = get_watchlist_for_exchange(current_doc)
             token_config = get_token_config_for_exchange(current_doc)
+            logger.info(f"[{exchange_name.upper()}] Watchlist: {watchlist}")
             if not watchlist:
                 await asyncio.sleep(60)
                 continue
-            session = await get_http_session()
-            avail_cache_key = f"{api.exchange_name}_avail_symbols"
-            avail_symbols = get_cached_data(avail_cache_key, _api_cache)
-            if avail_symbols is None:
-                avail_symbols = await api.get_available_spot_symbols(session)
-                if avail_symbols: set_cache_data(avail_cache_key, avail_symbols, 300, _api_cache)
-                else: avail_symbols = set(watchlist)
-            filtered = [s for s in watchlist if s in avail_symbols][:30]
-            if not filtered:
-                await asyncio.sleep(60)
-                continue
+                
+            session = await SessionManager.get_session()
+            
             srv_time = await api.get_server_time(session)
             min_start = (int(srv_time) // 60 - 1) * 60
             min_start_ms = min_start * 1000
             min_end_ms = (min_start + 59) * 1000
+            
+            avail_cache_key = f"{api.exchange_name}_avail_symbols"
+            avail_symbols = get_cached_data(avail_cache_key, _api_cache)
+            if avail_symbols is None:
+                avail_symbols = await api.get_available_symbols(session)
+                if avail_symbols: 
+                    set_cache_data(avail_cache_key, avail_symbols, 300, _api_cache)
+                else: 
+                    logger.warning(f"[{api.exchange_name.upper()}] get_available_symbols returned empty. Falling back to watchlist.")
+                    avail_symbols = set(watchlist)
+            
+            filtered = [s for s in watchlist if s in avail_symbols][:30]
+            if not filtered:
+                logger.warning(f"[{api.exchange_name.upper()}] No symbols from watchlist found in available symbols.")
+                await asyncio.sleep(60)
+                continue
 
             await check_green_candles_for_symbols(api, token_config)
             await check_solo_volatility_for_symbols(api, token_config)
             await check_token_transactions_for_symbols(api, token_config)
+            
             for symbol in filtered:
                 try:
-                    cache_key = f"{api.exchange_name}_trades_{symbol}_1000"
-                    trades = get_cached_data(cache_key, _api_cache)
-                    if trades is None:
-                        trades = await api.fetch_recent_trades_single(session, symbol, 1000)
-                        set_cache_data(cache_key, trades, CACHE_TTL, _api_cache)
-                    if not trades:
-                        logging.warning(f"[{api.exchange_name.upper()}] No trades returned for {symbol}")
-                        continue
-                        
                     cfg = token_config.get(symbol)
                     if not cfg: continue
                     
+                    cache_key = f"{api.exchange_name}_trades_{symbol}_1000"
+                    trades = get_cached_data(cache_key, _api_cache)
+                    if trades is None:
+                        trades = await api.fetch_recent_trades(session, symbol, 1000)
+                        set_cache_data(cache_key, trades, CACHE_TTL, _api_cache)
+                    if not trades: continue
+                        
                     min_vol = 0.0
                     v_count = 0
                     trade_ts_range = []
                     for t in trades:
-                        p, s, ts, side = api.parse_trade_history(t)
+                        p, s, ts, side = api.parse_trade(t)
                         if ts: trade_ts_range.append(ts)
                         if ts and p and s and min_start_ms <= ts <= min_end_ms:
                             min_vol += s * p
                             v_count += 1
                     
                     if trade_ts_range:
-                        logging.debug(f"[{api.exchange_name.upper()}] {symbol} trade TS range: {min(trade_ts_range)} to {max(trade_ts_range)} (need {min_start_ms}-{min_end_ms})")
+                        logger.debug(f"[{api.exchange_name.upper()}] {symbol} trade TS range: {min(trade_ts_range)} to {max(trade_ts_range)} (need {min_start_ms}-{min_end_ms})")
                     
-                    candles = await api.fetch_kline_data(session, symbol, "1", 5)
+                    candles = await api.fetch_klines(session, symbol, "1", 5)
                     volatility = None
                     if candles:
                         cand_ts = []
                         for c in candles:
-                            ts, o, h, l, cl = api.parse_kline_format(c)
+                            ts, o, h, l, cl, _ = api.parse_kline(c)
                             if ts is not None: cand_ts.append(ts)
                             if ts is not None and min_start_ms - 30000 <= ts <= min_start_ms + 30000:
                                 if l and h and l > 0: volatility = (h - l) / l
                                 break
-                        logging.debug(f"[{api.exchange_name.upper()}] {symbol} candle TS found: {cand_ts}")
-
+                        logger.debug(f"[{api.exchange_name.upper()}] {symbol} candle TS found: {cand_ts}")
+  
                     if (min_vol > cfg["minute_volume"]) and (volatility is not None and volatility <= cfg["volatility"]):
                         msg = f"🚨 [{api.exchange_name.upper()}] АНОМАЛЬНАЯ АКТИВНОСТЬ!\n\n"
                         msg += f"{symbol}: объем за минуту {time.strftime('%Y-%m-%d %H:%M', time.gmtime(min_start))} = {min_vol:.2f} $ ({v_count} сделок)\n"
@@ -378,49 +426,52 @@ async def check_volume_rest_for_exchange(exchange_doc: Dict):
                         threshold_str = f"{cfg['volatility']:.4%}" if cfg.get('volatility') is not None else "N/A"
                         
                         msg += f"волатильность: {volty_str} [Пороги: объем>{cfg['minute_volume']}$, волат<={threshold_str}]"
-                        logging.info(f"MATCH! Sending Telegram alert for {symbol} on {api.exchange_name}")
+                        logger.info(f"MATCH! Sending Telegram alert for {symbol} on {api.exchange_name}")
                         for chat_id in CHAT_IDS:
                             try:
                                 if bot: await bot.send_message(chat_id=chat_id, text=msg)
                             except Exception as te:
-                                logging.error(f"Telegram error: {te}")
+                                logger.error(f"Telegram error: {te}")
                     else:
                         volty_val = f"{volatility:.4%}" if volatility is not None else "N/A"
-                        logging.info(f"[{api.exchange_name.upper()}] {symbol}: Vol={min_vol:.2f}$ (need >{cfg['minute_volume']}$), Volty={volty_val} (need <={cfg['volatility']:.4%})")
+                        logger.info(f"[{api.exchange_name.upper()}] {symbol}: Vol={min_vol:.2f}$ (need >{cfg['minute_volume']}$), Volty={volty_val} (need <={cfg['volatility']:.4%})")
 
                 except Exception as e:
-                    logging.error(f"Error processing {symbol} on {api.exchange_name}: {e}")
+                    logger.error(f"Error processing {symbol} on {api.exchange_name}: {e}")
             
-            logging.info(f"[HEARTBEAT] [{api.exchange_name.upper()}] Processed {len(filtered)} symbols via REST.")
+            logger.info(f"[HEARTBEAT] [{exchange_name.upper()}] Processed {len(filtered)} symbols via REST.")
             
             heartbeat_counter += 1
             if heartbeat_counter % 10 == 0:
                 for d in [_api_cache, _config_cache]:
                     exp = [k for k, v in d.items() if v.is_expired()]
                     for k in exp: del d[k]
-        except Exception: pass
+        except Exception as e:
+            logger.error(f'Error in volume_tracker loop: {e}', exc_info=True)
         sleep_time = 60 - (int(time.time()) % 60)
         await asyncio.sleep(max(sleep_time, 1))
 
-
-
 async def run_all_exchange_monitors():
-    try:
-        all_exchange_configs = get_all_exchanges_config_from_mongo()
-        if not all_exchange_configs:
-            logger.warning("No exchange configurations found in MongoDB. Ensure 'exchange' and 'global_tracking': true are set in your DB collections.")
-            all_exchange_configs = [{'exchange': 'bybit'}]
+    logger.info("Starting all exchange monitors manager...")
+    while True:
+        try:
+            # Re-fetch configurations to pick up new exchanges
+            all_exchange_configs = get_all_exchanges_config_from_mongo()
+            if not all_exchange_configs:
+                logger.warning("No exchange configurations found in MongoDB.")
+                all_exchange_configs = [{'exchange': 'bybit'}]
+                
+            for config in all_exchange_configs:
+                exchange_name = config.get("exchange", "bybit").lower().strip()
+                # If monitor not active or was crashed/finished, start it
+                if exchange_name not in _active_monitors or _active_monitors[exchange_name].done():
+                    logger.info(f"Starting monitor task for {exchange_name.upper()}...")
+                    task = asyncio.create_task(check_volume_rest_for_exchange(config))
+                    _active_monitors[exchange_name] = task
+        except Exception as e:
+            logger.error(f"Error in monitor manager: {e}")
             
-        tasks = []
-        for config in all_exchange_configs:
-            exchange_name = config.get("exchange", "bybit")
-            logger.info(f"Starting monitors for {exchange_name}...")
-            tasks.append(check_volume_rest_for_exchange(config))
-            
-        await asyncio.gather(*tasks)
-    except KeyboardInterrupt: pass
-    finally:
-        pass
+        await asyncio.sleep(60)
 
 async def run_volume_tracker():
     await run_all_exchange_monitors()
